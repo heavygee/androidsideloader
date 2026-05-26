@@ -1,4 +1,5 @@
 using AndroidSideloader.Models;
+using AndroidSideloader.Services;
 using AndroidSideloader.Utilities;
 using JR.Utils.GUI.Forms;
 using Microsoft.Web.WebView2.Core;
@@ -111,6 +112,7 @@ namespace AndroidSideloader
         public static PublicConfig PublicConfigFile;
         public static string PublicMirrorExtraArgs = GetPublicMirrorArgs();
         public static string storedIpPath;
+        private static string wirelessConnectionStorePath;
         public static string aaptPath;
         private System.Windows.Forms.Timer _debounceTimer;
         private CancellationTokenSource _cts;
@@ -121,6 +123,7 @@ namespace AndroidSideloader
         public MainForm()
         {
             storedIpPath = Path.Combine(Environment.CurrentDirectory, "platform-tools", "StoredIP.txt");
+            wirelessConnectionStorePath = Path.Combine(Environment.CurrentDirectory, "platform-tools", "WirelessAdbConnections.json");
             aaptPath = Path.Combine(Environment.CurrentDirectory, "platform-tools", "aapt.exe");
             InitializeComponent();
             this.Opacity = 0;
@@ -805,51 +808,7 @@ namespace AndroidSideloader
             deviceConnectionTask = Task.Run(() =>
             {
                 changeTitle("Connecting to device...");
-                if (!string.IsNullOrEmpty(settings.IPAddress))
-                {
-                    string path = Path.Combine(Environment.CurrentDirectory, "platform-tools", "adb.exe");
-                    ProcessOutput wakeywakey = ADB.RunCommandToString($"\"{path}\" shell input keyevent KEYCODE_WAKEUP", path);
-                    if (wakeywakey.Output.Contains("more than one"))
-                    {
-                        settings.Wired = true;
-                        settings.Save();
-                    }
-                    else if (wakeywakey.Output.Contains("found"))
-                    {
-                        settings.Wired = false;
-                        settings.Save();
-                    }
-                }
-
-                if (File.Exists(storedIpPath) && !settings.Wired)
-                {
-                    string IPcmndfromtxt = File.ReadAllText(storedIpPath);
-                    settings.IPAddress = IPcmndfromtxt;
-                    settings.Save();
-                    ProcessOutput IPoutput = ADB.RunAdbCommandToString(IPcmndfromtxt);
-                    if (IPoutput.Output.Contains("attempt failed") || IPoutput.Output.Contains("refused"))
-                    {
-                        this.Invoke(() =>
-                        {
-                            _ = FlexibleMessageBox.Show(Program.form,
-                                "Attempt to connect to saved IP has failed. This is usually due to rebooting the device or not having a STATIC IP set in your router.\nYou must enable Wireless ADB again!");
-                        });
-                        settings.IPAddress = "";
-                        settings.Save();
-                        try { File.Delete(storedIpPath); }
-                        catch (Exception ex) { Logger.Log($"Unable to delete StoredIP.txt due to {ex.Message}", LogLevel.ERROR); }
-                    }
-                    else
-                    {
-                        _ = ADB.RunAdbCommandToString("shell settings put global wifi_wakeup_available 1");
-                        _ = ADB.RunAdbCommandToString("shell settings put global wifi_wakeup_enabled 1");
-                    }
-                }
-                else if (!File.Exists(storedIpPath))
-                {
-                    settings.IPAddress = "";
-                    settings.Save();
-                }
+                TryReconnectSavedWirelessAdbConnections();
             });
 
             // Start metadata task in parallel
@@ -5360,6 +5319,99 @@ namespace AndroidSideloader
 
         }
 
+        private static AdbWirelessReconnectService CreateWirelessReconnectService()
+        {
+            return new AdbWirelessReconnectService(
+                new WirelessAdbConnectionStore(wirelessConnectionStorePath),
+                new AdbCommandRunner(),
+                () => DateTime.UtcNow);
+        }
+
+        private static string ExtractWirelessSerial(string connectCommandOrSerial)
+        {
+            if (string.IsNullOrWhiteSpace(connectCommandOrSerial)) return null;
+
+            string value = connectCommandOrSerial.Trim();
+            if (value.StartsWith("connect ", StringComparison.OrdinalIgnoreCase))
+            {
+                value = value.Substring("connect ".Length).Trim();
+            }
+
+            return value.Contains(":") ? value : value + ":5555";
+        }
+
+        private static void RememberWirelessAdbConnection(string connectCommandOrSerial)
+        {
+            string serial = ExtractWirelessSerial(connectCommandOrSerial);
+            if (string.IsNullOrWhiteSpace(serial)) return;
+
+            CreateWirelessReconnectService().RememberSuccessfulConnection(serial);
+        }
+
+        private void TryReconnectSavedWirelessAdbConnections()
+        {
+            if (!string.IsNullOrEmpty(settings.IPAddress))
+            {
+                string path = Path.Combine(Environment.CurrentDirectory, "platform-tools", "adb.exe");
+                ProcessOutput wakeywakey = ADB.RunCommandToString($"\"{path}\" shell input keyevent KEYCODE_WAKEUP", path);
+                if (wakeywakey.Output.Contains("more than one"))
+                {
+                    settings.Wired = true;
+                    settings.Save();
+                }
+                else if (wakeywakey.Output.Contains("found"))
+                {
+                    settings.Wired = false;
+                    settings.Save();
+                }
+            }
+
+            if (settings.Wired)
+            {
+                Logger.Log("Skipping wireless ADB reconnect because wired mode is active.");
+                return;
+            }
+
+            try
+            {
+                if (File.Exists(storedIpPath))
+                {
+                    string legacyCommand = File.ReadAllText(storedIpPath);
+                    string legacySerial = ExtractWirelessSerial(legacyCommand);
+                    if (!string.IsNullOrWhiteSpace(legacySerial))
+                    {
+                        RememberWirelessAdbConnection(legacySerial);
+                    }
+                }
+
+                AdbReconnectResult reconnectResult = CreateWirelessReconnectService().TryReconnectLastActive();
+                if (reconnectResult.Success)
+                {
+                    string connectCommand = "connect " + reconnectResult.Serial;
+                    settings.IPAddress = connectCommand;
+                    settings.WirelessADB = true;
+                    settings.Wired = false;
+                    settings.Save();
+                    ADB.wirelessadbON = true;
+
+                    try { File.WriteAllText(storedIpPath, connectCommand); }
+                    catch (Exception ex) { Logger.Log("Unable to update StoredIP.txt: " + ex.Message, LogLevel.WARNING); }
+
+                    ADB.RunAdbCommandToString("shell settings put global wifi_wakeup_available 1", suppressLogging: true);
+                    ADB.RunAdbCommandToString("shell settings put global wifi_wakeup_enabled 1", suppressLogging: true);
+                    Logger.Log("Reconnected saved wireless ADB device: " + reconnectResult.Serial);
+                }
+                else
+                {
+                    Logger.Log("Saved wireless ADB reconnect did not connect: " + reconnectResult.Message, LogLevel.WARNING);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Log("Saved wireless ADB reconnect failed: " + ex.Message, LogLevel.WARNING);
+            }
+        }
+
         private async void ADBWirelessToggle_Click(object sender, EventArgs e)
         {
             // Check if wireless ADB is currently enabled by verifying actual connection
@@ -5425,6 +5477,7 @@ namespace AndroidSideloader
                 if (action == "disable")
                 {
                     ADB.wirelessadbON = false;
+                    CreateWirelessReconnectService().DisableAutoReconnect();
                     changeTitle("Disabling wireless ADB...");
                     progressBar.IsIndeterminate = true;
                     progressBar.OperationType = "";
@@ -5587,6 +5640,7 @@ namespace AndroidSideloader
                         settings.IPAddress = IPcmnd;
                         settings.WirelessADB = true;
                         settings.Save();
+                        RememberWirelessAdbConnection(IPcmnd);
 
                         try { File.WriteAllText(storedIpPath, IPcmnd); }
                         catch (Exception ex) { Logger.Log($"Unable to write to StoredIP.txt: {ex.Message}", LogLevel.ERROR); }
@@ -5668,6 +5722,7 @@ namespace AndroidSideloader
             settings.IPAddress = ipCommand;
             settings.WirelessADB = true;
             settings.Save();
+            RememberWirelessAdbConnection(ipCommand);
 
             try
             {
